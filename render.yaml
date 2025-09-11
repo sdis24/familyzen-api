@@ -1,0 +1,12 @@
+services:
+  - type: web
+    name: familyzen-api
+    env: node
+    plan: free
+    buildCommand: npm ci
+    startCommand: npm start
+    healthCheckPath: /health
+    autoDeploy: true
+    envVars:
+      - key: CORS_ORIGIN
+        value: "*"
