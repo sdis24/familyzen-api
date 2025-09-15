@@ -1,0 +1,77 @@
+﻿name: familyzen
+
+services:
+  db:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB:-familyzen}
+      POSTGRES_USER: ${POSTGRES_USER:-familyzen}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-familyzen}
+    volumes:
+      - db_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U $$POSTGRES_USER -d $$POSTGRES_DB"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+    ports:
+      - "5432:5432"
+    profiles: ["dev","prod"]
+
+  api:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    env_file:
+      - ./backend/.env
+    depends_on:
+      db:
+        condition: service_healthy
+    ports:
+      - "8000:8000"
+    healthcheck:
+      test: ["CMD-SHELL","curl -fsS http://localhost:8000/health"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+    profiles: ["dev","prod"]
+
+  web-dev:
+    image: node:20-alpine
+    working_dir: /app
+    volumes:
+      - ./frontend:/app
+    command: sh -c "npm install && npm run dev -- --host 0.0.0.0"
+    environment:
+      - VITE_API_URL=http://localhost/api
+    ports:
+      - "5173:5173"
+    depends_on:
+      api:
+        condition: service_healthy
+    profiles: ["dev"]
+
+  web:
+    build:
+      context: ./frontend
+      dockerfile: Dockerfile
+    depends_on:
+      api:
+        condition: service_healthy
+    profiles: ["prod"]
+
+  proxy:
+    image: caddy:2-alpine
+    volumes:
+      - ./proxy/Caddyfile:/etc/caddy/Caddyfile:ro
+    ports:
+      - "80:80"
+    depends_on:
+      web:
+        condition: service_started
+      api:
+        condition: service_healthy
+    profiles: ["prod"]
+
+volumes:
+  db_data:
