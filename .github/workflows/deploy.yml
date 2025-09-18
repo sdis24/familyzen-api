@@ -2,7 +2,7 @@ name: Deploy to VM (Docker Compose)
 
 on:
   push:
-    branches: [ main ]   # ← ta branche par défaut
+    branches: [ main ]   # adapte si ta branche par défaut n'est pas 'main'
 
 jobs:
   deploy:
@@ -11,12 +11,33 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v4
 
+      # --- Smoke test : vérifier la connexion SSH et l'environnement ---
+      - name: SSH smoke test (uname, whoami, docker --version)
+        uses: appleboy/ssh-action@v1.0.3
+        with:
+          host: ${{ secrets.VM_HOST }}
+          username: ${{ secrets.VM_USER }}
+          key: ${{ secrets.VM_SSH_KEY }}
+          script_stop: true
+          debug: true
+          script: |
+            set -x
+            whoami
+            uname -a
+            id
+            ls -la /opt || true
+            which docker || true
+            sudo docker --version || true
+
+      # --- Déploiement ---
       - name: Deploy on VM via SSH
         uses: appleboy/ssh-action@v1.0.3
         with:
           host: ${{ secrets.VM_HOST }}
           username: ${{ secrets.VM_USER }}
           key: ${{ secrets.VM_SSH_KEY }}
+          script_stop: true
+          debug: true
           script: |
             set -euo pipefail
 
