@@ -2,7 +2,7 @@ name: Deploy to VM (Docker Compose)
 
 on:
   push:
-    branches: [ master ]   # mets 'main' si ta branche par défaut s'appelle main
+    branches: [ main ]   # ← ta branche par défaut
 
 jobs:
   deploy:
@@ -22,9 +22,9 @@ jobs:
 
             APP_DIR=/opt/familyzen
             REPO=https://github.com/sdis24/familyzen-api.git
-            BRANCH=master   # ou main
+            BRANCH=main
 
-            # Docker si absent
+            # 1) Installer Docker si absent
             if ! command -v docker >/dev/null 2>&1; then
               sudo apt-get update -y
               sudo apt-get install -y ca-certificates curl gnupg
@@ -37,11 +37,11 @@ jobs:
               sudo systemctl enable --now docker
             fi
 
-            # Dossier & droits
+            # 2) Préparer le dossier
             sudo mkdir -p "$APP_DIR"
             sudo chown $USER:$USER "$APP_DIR"
 
-            # Code
+            # 3) Code (clone initial ou mise à jour)
             if [ ! -d "$APP_DIR/.git" ]; then
               git clone --depth 1 --branch "$BRANCH" "$REPO" "$APP_DIR"
             else
@@ -52,14 +52,14 @@ jobs:
 
             cd "$APP_DIR"
 
-            # Build & run
+            # 4) Build & run
             sudo docker compose up -d --build
 
-            # Health check (<= 2 min)
+            # 5) Health check (jusqu'à 2 min)
             end=$((SECONDS+120))
             until curl -fsS http://localhost:8000/health | grep -q '"ok": *true'; do
               if [ $SECONDS -ge $end ]; then
-                echo '[Health KO] Logs récents :'
+                echo '[Health KO] Derniers logs:'
                 sudo docker compose logs --tail 200
                 exit 1
               fi
