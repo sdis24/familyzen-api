@@ -1,0 +1,68 @@
+name: Deploy to VM (Docker Compose)
+
+on:
+  push:
+    branches: [ master ]   # mets 'main' si ta branche par défaut s'appelle main
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Deploy on VM via SSH
+        uses: appleboy/ssh-action@v1.0.3
+        with:
+          host: ${{ secrets.VM_HOST }}
+          username: ${{ secrets.VM_USER }}
+          key: ${{ secrets.VM_SSH_KEY }}
+          script: |
+            set -euo pipefail
+
+            APP_DIR=/opt/familyzen
+            REPO=https://github.com/sdis24/familyzen-api.git
+            BRANCH=master   # ou main
+
+            # Docker si absent
+            if ! command -v docker >/dev/null 2>&1; then
+              sudo apt-get update -y
+              sudo apt-get install -y ca-certificates curl gnupg
+              sudo install -m 0755 -d /etc/apt/keyrings
+              curl -fsSL https://download.docker.com/linux/debian/gpg | sudo gpg --dearmor -o /etc/apt/keyrings/docker.gpg
+              echo "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/docker.gpg] https://download.docker.com/linux/debian \
+              $(. /etc/os-release && echo $VERSION_CODENAME) stable" | sudo tee /etc/apt/sources.list.d/docker.list > /dev/null
+              sudo apt-get update -y
+              sudo apt-get install -y docker-ce docker-ce-cli containerd.io docker-compose-plugin
+              sudo systemctl enable --now docker
+            fi
+
+            # Dossier & droits
+            sudo mkdir -p "$APP_DIR"
+            sudo chown $USER:$USER "$APP_DIR"
+
+            # Code
+            if [ ! -d "$APP_DIR/.git" ]; then
+              git clone --depth 1 --branch "$BRANCH" "$REPO" "$APP_DIR"
+            else
+              cd "$APP_DIR"
+              git fetch --all --prune
+              git reset --hard "origin/$BRANCH"
+            fi
+
+            cd "$APP_DIR"
+
+            # Build & run
+            sudo docker compose up -d --build
+
+            # Health check (<= 2 min)
+            end=$((SECONDS+120))
+            until curl -fsS http://localhost:8000/health | grep -q '"ok": *true'; do
+              if [ $SECONDS -ge $end ]; then
+                echo '[Health KO] Logs récents :'
+                sudo docker compose logs --tail 200
+                exit 1
+              fi
+              sleep 2
+            done
+            echo '[Health OK]'
