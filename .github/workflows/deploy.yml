@@ -1,30 +1,98 @@
-# 4) Health check: jusqu’à 2 min (accepte JSON ou texte "ok")
-- name: Health check
-  uses: appleboy/ssh-action@v1.0.3
-  with:
-    host: ${{ secrets.VM_HOST }}
-    username: ${{ secrets.VM_USER }}
-    key: ${{ secrets.VM_SSH_KEY }}
-    script: |
-      set -euo pipefail
-      end=$((SECONDS+120))
-      ok=false
-      while [ $SECONDS -lt $end ]; do
-        code=$(curl -fsS -o /tmp/health.out -w "%{http_code}" http://localhost:8000/health || echo 000)
-        body=$(cat /tmp/health.out 2>/dev/null || true)
-        echo "Health code=$code body='$body'"
-        if [ "$code" = "200" ] && (echo "$body" | grep -qi '"ok"[[:space:]]*:[[:space:]]*true' || echo "$body" | grep -qi '\bok\b'); then
-          ok=true
-          break
-        fi
-        sleep 2
-      done
+name: Deploy to VM (Docker Compose)
 
-      if [ "$ok" != true ]; then
-        echo 'Health KO — logs docker ci-dessous:'
-        cd /opt/familyzen
-        sudo docker compose logs --tail 200 || true
-        exit 1
-      fi
+on:
+  push:
+    branches: [ main ]
+  workflow_dispatch:
 
-      echo 'Health OK'
+# Évite les déploiements qui se chevauchent (le plus récent gagne)
+concurrency:
+  group: deploy-vm
+  cancel-in-progress: true
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Deploy on VM via SSH (one-shot, résistant aux quotes)
+        uses: appleboy/ssh-action@v1.0.3
+        with:
+          host: ${{ secrets.VM_HOST }}
+          username: ${{ secrets.VM_USER }}
+          key: ${{ secrets.VM_SSH_KEY }}
+          script_stop: true
+          command_timeout: 30m
+          script: |
+            set -euo pipefail
+
+            # Variables de déploiement
+            APP_DIR=/opt/familyzen
+            REPO_URL="https://github.com/sdis24/familyzen-api.git"
+            BRANCH=main
+
+            # On crée un script root côté VM pour éviter tout souci de quoting YAML/Bash
+            sudo bash -s <<'BASH'
+            set -euo pipefail
+
+            APP_DIR="/opt/familyzen"
+            REPO_URL="https://github.com/sdis24/familyzen-api.git"
+            BRANCH="main"
+
+            echo "[deploy] start $(date -Is)"
+
+            # 1) Installer Docker/Compose si absent (Debian/Google images)
+            if ! command -v docker >/dev/null 2>&1; then
+              apt-get update -y
+              apt-get install -y ca-certificates curl gnupg
+              install -m 0755 -d /etc/apt/keyrings
+              curl -fsSL https://download.docker.com/linux/debian/gpg | gpg --dearmor -o /etc/apt/keyrings/docker.gpg
+              chmod a+r /etc/apt/keyrings/docker.gpg
+              echo "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/docker.gpg] https://download.docker.com/linux/debian $(. /etc/os-release && echo "$VERSION_CODENAME") stable" > /etc/apt/sources.list.d/docker.list
+              apt-get update -y
+              apt-get install -y docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin
+            fi
+
+            # 2) Préparer le dossier de l’app
+            mkdir -p "$APP_DIR"
+            chown -R ${SUDO_USER:-root}:${SUDO_USER:-root} "$APP_DIR" || true
+
+            # 3) Code: clone initial ou reset hard sur la branche
+            if [ ! -d "$APP_DIR/.git" ]; then
+              git clone --depth=1 -b "$BRANCH" "$REPO_URL" "$APP_DIR"
+            else
+              cd "$APP_DIR"
+              git fetch --all --prune
+              git reset --hard "origin/$BRANCH"
+            fi
+
+            cd "$APP_DIR"
+
+            # 4) Build & run (Docker Compose plugin)
+            docker compose -f docker-compose.yml up -d --build
+
+            # 5) Health check tolérant (JSON {"ok": true} OU texte 'ok'), via :80 OU :8000
+            end=$((SECONDS+180))
+            ok=false
+            while [ $SECONDS -lt $end ]; do
+              for URL in http://localhost/health http://localhost:8000/health; do
+                code=$(curl -fsS -o /tmp/health.out -w "%{http_code}" "$URL" || echo 000)
+                body=$(cat /tmp/health.out 2>/dev/null || true)
+                echo "[$(date -Is)] check $URL -> $code '$body'"
+                if [ "$code" = "200" ] && (echo "$body" | grep -qi '"ok"[[:space:]]*:[[:space:]]*true' || echo "$body" | grep -qi '\bok\b'); then
+                  ok=true
+                  break 2
+                fi
+              done
+              sleep 2
+            done
+
+            if [ "$ok" != true ]; then
+              echo '*** HEALTH CHECK FAILED ***'
+              docker ps
+              echo '--- docker compose logs (tail 200) ---'
+              docker compose logs --no-color --tail 200 || true
+              exit 1
+            fi
+
+            echo '*** DEPLOYMENT OK ***'
+            BASH
