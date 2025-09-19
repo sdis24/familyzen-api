@@ -5,42 +5,52 @@ script: |
   REPO=https://github.com/sdis24/familyzen-api.git
   BRANCH=main
 
-  # ---- Docker / Compose si absent ----
+  # -- Installer Docker/Compose si besoin --
   if ! command -v docker >/dev/null 2>&1; then
     sudo apt-get update
     sudo apt-get install -y ca-certificates curl gnupg
     sudo install -m 0755 -d /etc/apt/keyrings
-    curl -fsSL https://download.docker.com/linux/debian/gpg | sudo gpg --dearmor -o /etc/apt/keyrings/docker.gpg
-    echo "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/docker.gpg] https://download.docker.com/linux/debian \
-    $(. /etc/os-release && echo "$VERSION_CODENAME") stable" | sudo tee /etc/apt/sources.list.d/docker.list >/dev/null
+    curl -fsSL https://download.docker.com/linux/debian/gpg \
+      | sudo gpg --dearmor -o /etc/apt/keyrings/docker.gpg
+    echo "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/docker.gpg] https://download.docker.com/linux/debian $(. /etc/os-release && echo "$VERSION_CODENAME") stable" \
+      | sudo tee /etc/apt/sources.list.d/docker.list >/dev/null
     sudo apt-get update
     sudo apt-get install -y docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin
   fi
 
-  # ---- Prépare le dossier de déploiement ----
+  # -- Préparer le dossier --
   sudo mkdir -p "$APP_DIR"
   sudo chown "$USER:$USER" "$APP_DIR"
 
+  # -- Code: clone ou pull --
   if [ -d "$APP_DIR/.git" ]; then
     echo "[deploy] Repo déjà présent → fetch + reset"
     cd "$APP_DIR"
     git fetch --all --prune
     git reset --hard "origin/$BRANCH"
   else
-    echo "[deploy] Repo absent"
-    # si le dossier n'est pas vide, on le vide pour éviter l'erreur 'destination exists'
+    echo "[deploy] Repo absent → clone"
+    # si non vide, on nettoie pour éviter 'destination exists'
     if [ -n "$(ls -A "$APP_DIR" 2>/dev/null || true)" ]; then
-      echo "[deploy] Dossier non vide → cleanup"
       rm -rf "${APP_DIR:?}/"*
     fi
     git clone --depth=1 -b "$BRANCH" "$REPO" "$APP_DIR"
     cd "$APP_DIR"
   fi
 
-  # ---- Build & run ----
+  # -- Override pour exposer le port 8000 (si le compose du repo ne le fait pas) --
+  cat > docker-compose.override.yml <<'YML'
+  services:
+    api:
+      ports:
+        - "8000:8000"
+      restart: unless-stopped
+  YML
+
+  # -- Build & run --
   sudo docker compose up -d --build
 
-  # ---- Health check (2 min max) ----
+  # -- Health check (2 min max) --
   end=$((SECONDS+120))
   until curl -fsS http://localhost:8000/health | grep -q '"ok":[[:space:]]*true'; do
     if [ $SECONDS -ge $end ]; then
