@@ -1,83 +1,54 @@
-name: Deploy to VM (Docker Compose)
+script: |
+  set -euo pipefail
 
-on:
-  push:
-    branches: [ main ]   # change to master if needed
+  APP_DIR=/opt/familyzen
+  REPO=https://github.com/sdis24/familyzen-api.git
+  BRANCH=main
 
-jobs:
-  deploy:
-    runs-on: ubuntu-latest
-    steps:
-      - name: Checkout repository
-        uses: actions/checkout@v4
+  # ---- Docker / Compose si absent ----
+  if ! command -v docker >/dev/null 2>&1; then
+    sudo apt-get update
+    sudo apt-get install -y ca-certificates curl gnupg
+    sudo install -m 0755 -d /etc/apt/keyrings
+    curl -fsSL https://download.docker.com/linux/debian/gpg | sudo gpg --dearmor -o /etc/apt/keyrings/docker.gpg
+    echo "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/docker.gpg] https://download.docker.com/linux/debian \
+    $(. /etc/os-release && echo "$VERSION_CODENAME") stable" | sudo tee /etc/apt/sources.list.d/docker.list >/dev/null
+    sudo apt-get update
+    sudo apt-get install -y docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin
+  fi
 
-      - name: Smoke test SSH (uname, whoami, docker)
-        uses: appleboy/ssh-action@v1.0.3
-        with:
-          host: ${{ secrets.VM_HOST }}
-          username: ${{ secrets.VM_USER }}
-          key: ${{ secrets.VM_SSH_KEY }}
-          script_stop: true
-          command_timeout: 20m
-          script: |
-            set -euxo pipefail
-            whoami
-            uname -a
-            id
-            sudo docker --version || true
-            sudo docker compose version || true
+  # ---- Prépare le dossier de déploiement ----
+  sudo mkdir -p "$APP_DIR"
+  sudo chown "$USER:$USER" "$APP_DIR"
 
-      - name: Deploy on VM
-        uses: appleboy/ssh-action@v1.0.3
-        with:
-          host: ${{ secrets.VM_HOST }}
-          username: ${{ secrets.VM_USER }}
-          key: ${{ secrets.VM_SSH_KEY }}
-          script_stop: true
-          command_timeout: 40m
-          script: |
-            set -euxo pipefail
-            APP_DIR=/opt/familyzen
-            REPO=https://github.com/sdis24/familyzen-api.git
-            BRANCH=main
+  if [ -d "$APP_DIR/.git" ]; then
+    echo "[deploy] Repo déjà présent → fetch + reset"
+    cd "$APP_DIR"
+    git fetch --all --prune
+    git reset --hard "origin/$BRANCH"
+  else
+    echo "[deploy] Repo absent"
+    # si le dossier n'est pas vide, on le vide pour éviter l'erreur 'destination exists'
+    if [ -n "$(ls -A "$APP_DIR" 2>/dev/null || true)" ]; then
+      echo "[deploy] Dossier non vide → cleanup"
+      rm -rf "${APP_DIR:?}/"*
+    fi
+    git clone --depth=1 -b "$BRANCH" "$REPO" "$APP_DIR"
+    cd "$APP_DIR"
+  fi
 
-            # Install Docker/Compose if missing
-            if ! command -v docker >/dev/null 2>&1; then
-              sudo apt-get update
-              sudo apt-get install -y ca-certificates curl gnupg
-              sudo install -m 0755 -d /etc/apt/keyrings
-              curl -fsSL https://download.docker.com/linux/debian/gpg | sudo gpg --dearmor -o /etc/apt/keyrings/docker.gpg
-              echo "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/docker.gpg] https://download.docker.com/linux/debian \
-              $(. /etc/os-release && echo "$VERSION_CODENAME") stable" | sudo tee /etc/apt/sources.list.d/docker.list > /dev/null
-              sudo apt-get update
-              sudo apt-get install -y docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin
-              sudo usermod -aG docker $USER || true
-            fi
+  # ---- Build & run ----
+  sudo docker compose up -d --build
 
-            sudo mkdir -p "$APP_DIR"
-            sudo chown $USER:$USER "$APP_DIR"
-
-            if [ ! -d "$APP_DIR/.git" ]; then
-              git clone --depth=1 -b "$BRANCH" "$REPO" "$APP_DIR"
-            else
-              cd "$APP_DIR"
-              git fetch --all --prune
-              git reset --hard "origin/$BRANCH"
-            fi
-
-            cd "$APP_DIR"
-            sudo docker compose up -d --build
-
-            # Health check (2 minutes max)
-            end=$((SECONDS+120)); ok=false
-            while [ $SECONDS -lt $end ]; do
-              if curl -fsS http://localhost:8000/health | grep -q '"ok": *true'; then ok=true; break; fi
-              sleep 2
-            done
-            if [ "$ok" != "true" ]; then
-              echo "Health KO — last logs:"
-              sudo docker compose ps || true
-              sudo docker compose logs --tail 200 || true
-              exit 1
-            fi
-            echo "Health OK"
+  # ---- Health check (2 min max) ----
+  end=$((SECONDS+120))
+  until curl -fsS http://localhost:8000/health | grep -q '"ok":[[:space:]]*true'; do
+    if [ $SECONDS -ge $end ]; then
+      echo "Health KO — derniers logs :"
+      sudo docker compose ps
+      sudo docker compose logs --tail 200
+      exit 1
+    fi
+    sleep 2
+  done
+  echo "Health OK"
