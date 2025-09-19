@@ -1,93 +1,21 @@
-name: Deploy to VM (Docker Compose)
+version: "3.9"
 
-on:
-  push:
-    branches: [ main ]
-
-concurrency:
-  group: deploy-familyzen
-  cancel-in-progress: true
-
-jobs:
-  deploy:
-    runs-on: ubuntu-latest
-    steps:
-      - name: Deploy on VM via SSH
-        uses: appleboy/ssh-action@v1.0.3
-        with:
-          host: ${{ secrets.VM_HOST }}
-          username: ${{ secrets.VM_USER }}
-          key: ${{ secrets.VM_SSH_KEY }}
-          # IMPORTANT: ne pas découper ligne par ligne
-          script_stop: false
-          command_timeout: 30m
-          script: |
-            bash -lc '
-              set -Eeuo pipefail
-
-              APP_DIR=/opt/familyzen
-              REPO=https://github.com/sdis24/familyzen-api.git
-              BRANCH=main
-              SUSER=$(id -un)
-
-              on_error() {
-                echo "::group::compose ps"
-                sudo docker compose -f "$APP_DIR/docker-compose.yml" ps || true
-                echo "::endgroup::"
-                echo "::group::compose logs (tail 200)"
-                sudo docker compose -f "$APP_DIR/docker-compose.yml" logs --no-color --tail=200 || true
-                echo "::endgroup::"
-              }
-              trap on_error ERR
-
-              # 1) Docker/Compose si manquants
-              if ! command -v docker >/dev/null 2>&1; then
-                sudo apt-get update -y
-                sudo apt-get install -y ca-certificates curl gnupg
-                sudo install -m 0755 -d /etc/apt/keyrings
-                curl -fsSL https://download.docker.com/linux/debian/gpg | sudo gpg --dearmor -o /etc/apt/keyrings/docker.gpg
-                echo "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/docker.gpg] https://download.docker.com/linux/debian $(. /etc/os-release && echo "$VERSION_CODENAME") stable" | sudo tee /etc/apt/sources.list.d/docker.list > /dev/null
-                sudo apt-get update -y
-                sudo apt-get install -y docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin
-              fi
-
-              # 2) Dossier & droits
-              sudo mkdir -p "$APP_DIR"
-              sudo chown "$SUSER:$SUSER" "$APP_DIR"
-
-              # 3) Code: clone ou reset hard
-              if [ ! -d "$APP_DIR/.git" ]; then
-                git clone --depth=1 --branch "$BRANCH" "$REPO" "$APP_DIR"
-              else
-                git -C "$APP_DIR" fetch --all --prune
-                git -C "$APP_DIR" reset --hard "origin/$BRANCH"
-              fi
-
-              # 4) Build & run
-              cd "$APP_DIR"
-              sudo docker compose down || true
-              sudo docker compose up -d --build
-
-              # 5) Health check (80 et 8080) jusqu'à 4 min
-              ok=false
-              deadline=$((SECONDS+240))
-              for url in http://localhost:8080/health http://localhost/health; do
-                while [ $SECONDS -lt $deadline ]; do
-                  code=$(curl -s -o /dev/null -w "%{http_code}" "$url" || true)
-                  if [ "$code" = "200" ]; then
-                    echo "Health OK at $url"
-                    ok=true
-                    break
-                  fi
-                  sleep 2
-                done
-                [ "$ok" = true ] && break
-              done
-
-              if [ "$ok" != true ]; then
-                echo "Health check FAILED"
-                on_error
-                exit 1
-              fi
-              echo "✅ DEPLOYMENT OK"
-            '
+services:
+  api:
+    build:
+      context: .              # <-- fix: PAS ./backend
+      dockerfile: Dockerfile  # adapte si le nom est différent
+    image: familyzen-api:latest
+    container_name: familyzen-api
+    ports:
+      - "8000:8000"
+      - "80:8000"             # utile si tu exposes aussi sur 80
+    env_file:
+      - .env
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://localhost:8000/health"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+      start_period: 20s
