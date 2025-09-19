@@ -1,90 +1,30 @@
-name: Deploy to VM (Docker Compose)
+# 4) Health check: jusqu’à 2 min (accepte JSON ou texte "ok")
+- name: Health check
+  uses: appleboy/ssh-action@v1.0.3
+  with:
+    host: ${{ secrets.VM_HOST }}
+    username: ${{ secrets.VM_USER }}
+    key: ${{ secrets.VM_SSH_KEY }}
+    script: |
+      set -euo pipefail
+      end=$((SECONDS+120))
+      ok=false
+      while [ $SECONDS -lt $end ]; do
+        code=$(curl -fsS -o /tmp/health.out -w "%{http_code}" http://localhost:8000/health || echo 000)
+        body=$(cat /tmp/health.out 2>/dev/null || true)
+        echo "Health code=$code body='$body'"
+        if [ "$code" = "200" ] && (echo "$body" | grep -qi '"ok"[[:space:]]*:[[:space:]]*true' || echo "$body" | grep -qi '\bok\b'); then
+          ok=true
+          break
+        fi
+        sleep 2
+      done
 
-on:
-  push:
-    branches: [ main ]   # adapte si ta branche par défaut est autre
+      if [ "$ok" != true ]; then
+        echo 'Health KO — logs docker ci-dessous:'
+        cd /opt/familyzen
+        sudo docker compose logs --tail 200 || true
+        exit 1
+      fi
 
-jobs:
-  deploy:
-    runs-on: ubuntu-latest
-
-    steps:
-      - name: Checkout repository
-        uses: actions/checkout@v4
-
-      # Petit smoke test pour valider les secrets + SSH et voir docker
-      - name: Smoke test SSH (uname, whoami, docker)
-        uses: appleboy/ssh-action@v1.0.3
-        with:
-          host: ${{ secrets.VM_HOST }}
-          username: ${{ secrets.VM_USER }}
-          key: ${{ secrets.VM_SSH_KEY }}
-          script_stop: true
-          script: |
-            set -e
-            echo "== whoami & kernel =="
-            whoami && uname -a || true
-            echo "== docker version (si présent) =="
-            docker --version || true
-
-      - name: Deploy on VM
-        uses: appleboy/ssh-action@v1.0.3
-        with:
-          host: ${{ secrets.VM_HOST }}
-          username: ${{ secrets.VM_USER }}
-          key: ${{ secrets.VM_SSH_KEY }}
-          script_stop: true
-          script: |
-            set -euo pipefail
-
-            APP_DIR=/opt/familyzen
-            REPO=https://github.com/sdis24/familyzen-api.git
-            BRANCH=main
-
-            # 1) Installer Docker/Compose si absent
-            if ! command -v docker >/dev/null 2>&1; then
-              sudo apt-get update -y
-              sudo apt-get install -y ca-certificates curl gnupg
-              sudo install -m 0755 -d /etc/apt/keyrings
-              curl -fsSL https://download.docker.com/linux/debian/gpg | sudo gpg --dearmor -o /etc/apt/keyrings/docker.gpg
-              echo "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/docker.gpg] https://download.docker.com/linux/debian \
-              $(. /etc/os-release; echo "$VERSION_CODENAME") stable" | sudo tee /etc/apt/sources.list.d/docker.list > /dev/null
-              sudo apt-get update -y
-              sudo apt-get install -y docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin
-            fi
-
-            # 2) Préparer le dossier appli
-            sudo mkdir -p "$APP_DIR"
-            sudo chown "$USER:$USER" "$APP_DIR"
-
-            # 3) Code: clone initial ou reset dur
-            if [ ! -d "$APP_DIR/.git" ]; then
-              git clone --depth=1 --branch "$BRANCH" "$REPO" "$APP_DIR"
-            else
-              cd "$APP_DIR"
-              git fetch --all --prune
-              git reset --hard "origin/$BRANCH"
-            fi
-
-            cd "$APP_DIR"
-
-            # 4) Build & run
-            sudo docker compose up -d --build
-
-            # 5) Health check (jusqu’à 2 min)
-            end=$((SECONDS+120))
-            ok=false
-            until $ok; do
-              if curl -fsS http://localhost:8000/health | grep -q '"ok":[[:space:]]*true'; then
-                echo "Health OK"
-                ok=true
-                break
-              fi
-              if [ $SECONDS -ge $end ]; then
-                echo "Health KO — logs Docker ci-dessous :"
-                sudo docker compose ps || true
-                sudo docker compose logs --tail 200 || true
-                exit 1
-              fi
-              sleep 2
-            done
+      echo 'Health OK'
