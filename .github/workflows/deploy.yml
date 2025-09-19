@@ -2,29 +2,30 @@ name: Deploy to VM (Docker Compose)
 
 on:
   push:
-    branches: [ main ]
+    branches: [ main ]   # adapte si ta branche par défaut est autre
 
 jobs:
   deploy:
     runs-on: ubuntu-latest
+
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
 
-      # (optionnel) Test rapide SSH pour voir l'environnement
+      # Petit smoke test pour valider les secrets + SSH et voir docker
       - name: Smoke test SSH (uname, whoami, docker)
         uses: appleboy/ssh-action@v1.0.3
         with:
           host: ${{ secrets.VM_HOST }}
           username: ${{ secrets.VM_USER }}
           key: ${{ secrets.VM_SSH_KEY }}
+          script_stop: true
           script: |
-            bash -lc '
-              set -eux
-              whoami
-              uname -a
-              command -v docker && docker --version || true
-            '
+            set -e
+            echo "== whoami & kernel =="
+            whoami && uname -a || true
+            echo "== docker version (si présent) =="
+            docker --version || true
 
       - name: Deploy on VM
         uses: appleboy/ssh-action@v1.0.3
@@ -32,51 +33,58 @@ jobs:
           host: ${{ secrets.VM_HOST }}
           username: ${{ secrets.VM_USER }}
           key: ${{ secrets.VM_SSH_KEY }}
+          script_stop: true
           script: |
-            bash -lc '
-              set -Eeuo pipefail
+            set -euo pipefail
 
-              APP_DIR=/opt/familyzen
-              REPO=https://github.com/sdis24/familyzen-api.git
-              BRANCH=main
+            APP_DIR=/opt/familyzen
+            REPO=https://github.com/sdis24/familyzen-api.git
+            BRANCH=main
 
-              # 1) Docker si absent (et on garde sudo pour être safe)
-              if ! command -v docker >/dev/null 2>&1; then
-                curl -fsSL https://get.docker.com | sudo sh
-                sudo usermod -aG docker "$USER" || true
-              fi
+            # 1) Installer Docker/Compose si absent
+            if ! command -v docker >/dev/null 2>&1; then
+              sudo apt-get update -y
+              sudo apt-get install -y ca-certificates curl gnupg
+              sudo install -m 0755 -d /etc/apt/keyrings
+              curl -fsSL https://download.docker.com/linux/debian/gpg | sudo gpg --dearmor -o /etc/apt/keyrings/docker.gpg
+              echo "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/docker.gpg] https://download.docker.com/linux/debian \
+              $(. /etc/os-release; echo "$VERSION_CODENAME") stable" | sudo tee /etc/apt/sources.list.d/docker.list > /dev/null
+              sudo apt-get update -y
+              sudo apt-get install -y docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin
+            fi
 
-              # 2) Préparer le dossier
-              sudo mkdir -p "$APP_DIR"
-              sudo chown "$USER:$USER" "$APP_DIR"
+            # 2) Préparer le dossier appli
+            sudo mkdir -p "$APP_DIR"
+            sudo chown "$USER:$USER" "$APP_DIR"
 
-              # 3) Code: clone initial ou reset hard sur la branche
-              if [ ! -d "$APP_DIR/.git" ]; then
-                git clone --depth=1 --branch "$BRANCH" "$REPO" "$APP_DIR"
-              else
-                cd "$APP_DIR"
-                git fetch --all --prune
-                git reset --hard "origin/$BRANCH"
-              fi
-
+            # 3) Code: clone initial ou reset dur
+            if [ ! -d "$APP_DIR/.git" ]; then
+              git clone --depth=1 --branch "$BRANCH" "$REPO" "$APP_DIR"
+            else
               cd "$APP_DIR"
+              git fetch --all --prune
+              git reset --hard "origin/$BRANCH"
+            fi
 
-              # 4) Build & run (sudo tant que la session n’a pas repris le groupe docker)
-              sudo docker compose up -d --build
+            cd "$APP_DIR"
 
-              # 5) Santé: on attend jusqu’à 2 min que /health réponde {"ok":true}
-              end=$((SECONDS+120))
-              while true; do
-                if curl -fsS http://localhost:8000/health | grep -q '"'"'"ok"'"'": *true"; then
-                  echo "Health OK"
-                  break
-                fi
-                if [ $SECONDS -ge $end ]; then
-                  echo "Health KO — logs docker ci-dessous :"
-                  sudo docker compose ps
-                  sudo docker compose logs --tail 200
-                  exit 1
-                fi
-                sleep 2
-              done
-            '
+            # 4) Build & run
+            sudo docker compose up -d --build
+
+            # 5) Health check (jusqu’à 2 min)
+            end=$((SECONDS+120))
+            ok=false
+            until $ok; do
+              if curl -fsS http://localhost:8000/health | grep -q '"ok":[[:space:]]*true'; then
+                echo "Health OK"
+                ok=true
+                break
+              fi
+              if [ $SECONDS -ge $end ]; then
+                echo "Health KO — logs Docker ci-dessous :"
+                sudo docker compose ps || true
+                sudo docker compose logs --tail 200 || true
+                exit 1
+              fi
+              sleep 2
+            done
