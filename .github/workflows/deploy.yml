@@ -4,7 +4,7 @@ on:
   push:
     branches: [ main ]
 
-# Annule le run précédent si un nouveau push arrive
+# Évite les courses : annule le déploiement en cours si un nouveau push arrive
 concurrency:
   group: deploy-familyzen
   cancel-in-progress: true
@@ -13,39 +13,28 @@ jobs:
   deploy:
     runs-on: ubuntu-latest
     steps:
-      - name: Smoke test SSH (uname, whoami, docker)
+      - name: Deploy on VM via SSH
         uses: appleboy/ssh-action@v1.0.3
         with:
           host: ${{ secrets.VM_HOST }}
           username: ${{ secrets.VM_USER }}
           key: ${{ secrets.VM_SSH_KEY }}
           script_stop: true
+          debug: true
           script: |
-            set -e
-            whoami
-            uname -a
-            docker --version || true
+            set -euo pipefail
 
-      - name: Deploy on VM
-        uses: appleboy/ssh-action@v1.0.3
-        with:
-          host: ${{ secrets.VM_HOST }}
-          username: ${{ secrets.VM_USER }}
-          key: ${{ secrets.VM_SSH_KEY }}
-          script_stop: true
-          script: |
-            # on écrit un script local pour éviter toute galère de quoting et on l'exécute
+            # On écrit un script local pour éviter tout souci de quoting, puis on l'exécute
             cat >/tmp/deploy.sh <<'BASH'
             #!/usr/bin/env bash
-            set -Eeuo pipefail
+            set -euo pipefail
+            set -x
 
             on_error() {
-              echo "::group::docker compose ps"
+              echo "---- docker compose ps ----"
               sudo docker compose -f "$APP_DIR/docker-compose.yml" ps || true
-              echo "::endgroup::"
-              echo "::group::docker logs (last 200)"
+              echo "---- docker compose logs (last 200) ----"
               sudo docker compose -f "$APP_DIR/docker-compose.yml" logs --no-color --tail=200 || true
-              echo "::endgroup::"
               exit 1
             }
             trap on_error ERR
@@ -53,8 +42,9 @@ jobs:
             APP_DIR=/opt/familyzen
             REPO="https://github.com/sdis24/familyzen-api.git"
             BRANCH="main"
+            SUSER="$(id -un)"   # ✅ fix: SUSER toujours défini, compatible avec 'set -u'
 
-            # 1) Docker / Compose si manquants
+            # 1) Docker + Compose si manquants
             if ! command -v docker >/dev/null 2>&1; then
               sudo apt-get update -y
               sudo apt-get install -y ca-certificates curl gnupg
@@ -64,13 +54,14 @@ jobs:
                 | sudo tee /etc/apt/sources.list.d/docker.list >/dev/null
               sudo apt-get update -y
               sudo apt-get install -y docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin
+              sudo usermod -aG docker "$SUSER" || true   # pas bloquant pour la session courante
             fi
 
             # 2) Dossier + droits
             sudo mkdir -p "$APP_DIR"
-            sudo chown "$USER:$USER" "$APP_DIR"
+            sudo chown "$SUSER:$SUSER" "$APP_DIR"
 
-            # 3) Code: clone ou reset hard
+            # 3) Code : clone ou reset hard
             if [ ! -d "$APP_DIR/.git" ]; then
               git clone --depth=1 --branch "$BRANCH" "$REPO" "$APP_DIR"
             else
@@ -82,16 +73,15 @@ jobs:
             cd "$APP_DIR"
             sudo docker compose up -d --build
 
-            # 5) Health check robuste (HTTP 200 sur /health en 8000 et 80)
+            # 5) Health check robuste (80 et 8000) jusqu'à 4 minutes
             ok=false
-            deadline=$((SECONDS+240))   # max 4 minutes
+            deadline=$((SECONDS+240))
             while [ $SECONDS -lt $deadline ]; do
               for url in http://localhost:8000/health http://localhost/health; do
                 code=$(curl -s -o /dev/null -w "%{http_code}" "$url" || true)
                 if [ "$code" = "200" ]; then
                   echo "Health OK at $url"
-                  ok=true
-                  break 2
+                  ok=true; break 2
                 fi
               done
               sleep 2
