@@ -4,21 +4,15 @@ on:
   push:
     branches: [ main ]
 
-# Évite les courses : un nouveau push annule le déploiement en cours
+# Annule le run précédent si un nouveau push arrive
 concurrency:
-  group: deploy-${{ github.ref }}
+  group: deploy-familyzen
   cancel-in-progress: true
 
 jobs:
   deploy:
     runs-on: ubuntu-latest
-
     steps:
-      - name: Checkout (metadata only)
-        uses: actions/checkout@v4
-        with:
-          fetch-depth: 1
-
       - name: Smoke test SSH (uname, whoami, docker)
         uses: appleboy/ssh-action@v1.0.3
         with:
@@ -26,9 +20,8 @@ jobs:
           username: ${{ secrets.VM_USER }}
           key: ${{ secrets.VM_SSH_KEY }}
           script_stop: true
-          debug: true
           script: |
-            set -euxo pipefail
+            set -e
             whoami
             uname -a
             docker --version || true
@@ -40,15 +33,28 @@ jobs:
           username: ${{ secrets.VM_USER }}
           key: ${{ secrets.VM_SSH_KEY }}
           script_stop: true
-          debug: true
           script: |
-            set -euo pipefail
+            # on écrit un script local pour éviter toute galère de quoting et on l'exécute
+            cat >/tmp/deploy.sh <<'BASH'
+            #!/usr/bin/env bash
+            set -Eeuo pipefail
+
+            on_error() {
+              echo "::group::docker compose ps"
+              sudo docker compose -f "$APP_DIR/docker-compose.yml" ps || true
+              echo "::endgroup::"
+              echo "::group::docker logs (last 200)"
+              sudo docker compose -f "$APP_DIR/docker-compose.yml" logs --no-color --tail=200 || true
+              echo "::endgroup::"
+              exit 1
+            }
+            trap on_error ERR
 
             APP_DIR=/opt/familyzen
-            REPO=https://github.com/sdis24/familyzen-api.git
-            BRANCH=main
+            REPO="https://github.com/sdis24/familyzen-api.git"
+            BRANCH="main"
 
-            # 1) Docker + Compose si manquants
+            # 1) Docker / Compose si manquants
             if ! command -v docker >/dev/null 2>&1; then
               sudo apt-get update -y
               sudo apt-get install -y ca-certificates curl gnupg
@@ -58,33 +64,27 @@ jobs:
                 | sudo tee /etc/apt/sources.list.d/docker.list >/dev/null
               sudo apt-get update -y
               sudo apt-get install -y docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin
-              sudo usermod -aG docker "$USER" || true   # pas bloquant pour la session courante
             fi
 
             # 2) Dossier + droits
             sudo mkdir -p "$APP_DIR"
             sudo chown "$USER:$USER" "$APP_DIR"
 
-            # 3) Code : clone ou reset dur
+            # 3) Code: clone ou reset hard
             if [ ! -d "$APP_DIR/.git" ]; then
-              echo "[code] fresh clone"
               git clone --depth=1 --branch "$BRANCH" "$REPO" "$APP_DIR"
             else
-              echo "[code] fetch + hard reset"
-              cd "$APP_DIR"
-              git fetch --all --prune
-              git reset --hard "origin/$BRANCH"
+              git -C "$APP_DIR" fetch --all --prune
+              git -C "$APP_DIR" reset --hard "origin/$BRANCH"
             fi
 
-            cd "$APP_DIR"
-
             # 4) Build & run
-            sudo docker compose down || true
+            cd "$APP_DIR"
             sudo docker compose up -d --build
 
             # 5) Health check robuste (HTTP 200 sur /health en 8000 et 80)
             ok=false
-            deadline=$((SECONDS+240))   # 4 minutes max
+            deadline=$((SECONDS+240))   # max 4 minutes
             while [ $SECONDS -lt $deadline ]; do
               for url in http://localhost:8000/health http://localhost/health; do
                 code=$(curl -s -o /dev/null -w "%{http_code}" "$url" || true)
@@ -97,11 +97,13 @@ jobs:
               sleep 2
             done
 
-            if ! $ok; then
-              echo "Health check FAILED – logs docker compose :"
-              sudo docker compose ps || true
-              sudo docker compose logs --no-color --tail=200 || true
-              exit 1
+            if [ "$ok" = true ]; then
+              echo "✅ DEPLOYMENT OK"
+              exit 0
+            else
+              echo "Health check FAILED"
+              on_error
             fi
+            BASH
 
-            echo "✅ DEPLOYMENT OK"
+            sudo bash /tmp/deploy.sh
