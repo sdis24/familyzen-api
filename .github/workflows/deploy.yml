@@ -24,7 +24,7 @@ jobs:
             set -euo pipefail
 
             APP_DIR="/opt/familyzen"
-            REPO_URL="https://github.com/sdis24/familyzen-api.git"   # adapte si besoin
+            REPO_URL="https://github.com/sdis24/familyzen-api.git"
             BRANCH="main"
 
             echo "--- [1/5] Install Docker si besoin ---"
@@ -55,6 +55,7 @@ jobs:
 
             echo "--- [4/5] Build & up ---"
             docker compose -f docker-compose.yml config >/dev/null
+            docker compose down -v --remove-orphans || true
             docker compose up -d --build
 
             echo "--- [5/5] Health check (3 min) ---"
