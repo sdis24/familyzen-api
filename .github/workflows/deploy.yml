@@ -1,21 +1,82 @@
-version: "3.9"
+name: Deploy to VM (Docker Compose)
 
-services:
-  api:
-    build:
-      context: .              # <-- fix: PAS ./backend
-      dockerfile: Dockerfile  # adapte si le nom est différent
-    image: familyzen-api:latest
-    container_name: familyzen-api
-    ports:
-      - "8000:8000"
-      - "80:8000"             # utile si tu exposes aussi sur 80
-    env_file:
-      - .env
-    restart: unless-stopped
-    healthcheck:
-      test: ["CMD", "curl", "-fsS", "http://localhost:8000/health"]
-      interval: 10s
-      timeout: 5s
-      retries: 12
-      start_period: 20s
+on:
+  push:
+    branches: [ main ]
+
+concurrency:
+  group: deploy-vm
+  cancel-in-progress: true
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Deploy on VM via SSH
+        uses: appleboy/ssh-action@v1.0.3
+        with:
+          host: ${{ secrets.VM_HOST }}
+          username: ${{ secrets.VM_USER }}
+          key: ${{ secrets.VM_SSH_KEY }}
+          command_timeout: 30m
+          script: |
+            sudo bash -s <<'END_SCRIPT'
+            set -euo pipefail
+
+            APP_DIR="/opt/familyzen"
+            REPO_URL="https://github.com/sdis24/familyzen-api.git"   # adapte si besoin
+            BRANCH="main"
+
+            echo "--- [1/5] Install Docker si besoin ---"
+            if ! command -v docker >/dev/null 2>&1; then
+              apt-get update -y && apt-get install -y ca-certificates curl gnupg git
+              install -m 0755 -d /etc/apt/keyrings
+              curl -fsSL https://download.docker.com/linux/debian/gpg | gpg --dearmor -o /etc/apt/keyrings/docker.gpg
+              chmod a+r /etc/apt/keyrings/docker.gpg
+              . /etc/os-release
+              echo "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/docker.gpg] https://download.docker.com/linux/debian ${VERSION_CODENAME} stable" > /etc/apt/sources.list.d/docker.list
+              apt-get update -y && apt-get install -y docker-ce docker-ce-cli containerd.io docker-compose-plugin
+            fi
+
+            echo "--- [2/5] Préparation dossier app ---"
+            mkdir -p "$APP_DIR"
+            chown -R ${SUDO_USER:-$USER}:${SUDO_USER:-$USER} "$APP_DIR"
+            git config --global --add safe.directory "$APP_DIR" || true
+
+            echo "--- [3/5] Sync code ---"
+            if [ ! -d "$APP_DIR/.git" ]; then
+              git clone --depth=1 -b "$BRANCH" "$REPO_URL" "$APP_DIR"
+            else
+              cd "$APP_DIR"
+              git fetch --all --prune
+              git reset --hard "origin/$BRANCH"
+            fi
+            cd "$APP_DIR"
+
+            echo "--- [4/5] Build & up ---"
+            docker compose -f docker-compose.yml config >/dev/null
+            docker compose up -d --build
+
+            echo "--- [5/5] Health check (3 min) ---"
+            deadline=$((SECONDS+180)); ok=false
+            while [ $SECONDS -lt $deadline ]; do
+              for path in /health /api/status /status /api/v1/ping; do
+                code=$(curl -s -o /dev/null -w "%{http_code}" "http://localhost:8000$path" || true)
+                if [ "$code" = "200" ]; then
+                  echo "✅ OK sur http://localhost:8000$path"
+                  ok=true; break
+                fi
+              done
+              [ "$ok" = true ] && break
+              sleep 2
+            done
+
+            if [ "$ok" != true ]; then
+              echo "❌ HEALTH CHECK FAILED"
+              docker compose ps
+              docker compose logs --no-color --tail 200
+              exit 1
+            fi
+
+            echo "✅ DEPLOIEMENT TERMINE"
+            END_SCRIPT
