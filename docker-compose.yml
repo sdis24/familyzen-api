@@ -1,0 +1,23 @@
+version: "3.9"
+
+services:
+  api:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: familyzen-api:latest
+    container_name: familyzen-api
+    ports:
+      - "8000:8000"   # http://IP:8000
+      # - "80:8000"    # décommente si tu veux aussi http://IP/
+    env_file:
+      - .env
+    restart: unless-stopped
+
+    # Laisse ce healthcheck commenté si l'image n'a pas wget/curl préinstallé
+    # healthcheck:
+    #   test: ["CMD-SHELL", "wget -q --spider http://localhost:8000/health || exit 1"]
+    #   interval: 10s
+    #   timeout: 5s
+    #   retries: 12
+    #   start_period: 20s
