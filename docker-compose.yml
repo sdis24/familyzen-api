@@ -10,8 +10,7 @@ services:
       NODE_ENV: "production"
     ports:
       - "8000:8000"
-      # - "80:8000"  # décommente si tu veux aussi http://IP/
-    restart: unless-stopped
+        restart: unless-stopped
 
     # Laisse le healthcheck commenté si l'image n'a pas wget/curl
     # healthcheck:
