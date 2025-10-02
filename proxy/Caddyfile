@@ -1,0 +1,5 @@
+﻿:80
+handle_path /api/*      { reverse_proxy api:8000 }
+handle_path /families/* { reverse_proxy api:8000 }
+handle_path /calendar/* { reverse_proxy api:8000 }
+handle { reverse_proxy web:80 }
